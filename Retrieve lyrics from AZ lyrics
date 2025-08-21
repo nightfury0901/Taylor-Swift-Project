@@ -1,0 +1,333 @@
+"""
+Taylor Swift Lyrics Collector — Album Grouped + Robust Resume
+=============================================================
+
+- Crawls AZLyrics Taylor Swift artist page
+- Saves songs into per-album folders
+- Randomized delays with polite headers
+- **Resume support** via progress.json (per-URL done list + per-album counters)
+- Detects AZLyrics block pages and exits cleanly so you can refresh, then rerun
+
+Usage:
+    python swift_lyrics_resume.py
+
+Notes:
+- Use responsibly; site structure/terms may change.
+- If blocked, refresh your browser/session (or wait), then rerun. The script will
+  resume where it left off.
+"""
+
+import os
+import re
+import json
+import time
+import random
+import shutil
+from typing import Tuple, List, Dict
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup, Comment
+
+# -------------------------------
+# Config
+# -------------------------------
+ARTIST_PAGE = "https://www.azlyrics.com/t/taylorswift.html"   # Or None to use SONG_URLS
+SONG_URLS: List[str] = []  # Manual list fallback if ARTIST_PAGE = None
+
+OUT_DIR = "lyrics"
+MIN_DELAY_SEC = 3
+MAX_DELAY_SEC = 10
+
+# polite headers
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; lyric-collector/1.0; +https://example.com/bot-info)"
+}
+
+# retries
+MAX_RETRIES = 2
+RETRY_BASE_WAIT = 2.0  # seconds (randomized jitter added)
+
+PROGRESS_PATH = os.path.join(OUT_DIR, "progress.json")
+
+# -------------------------------
+# Helpers
+# -------------------------------
+class BlockedError(Exception):
+    pass
+
+def sleep_random(min_s=MIN_DELAY_SEC, max_s=MAX_DELAY_SEC):
+    time.sleep(random.uniform(min_s, max_s))
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[\\/*?:"<>|]+', "", name).strip()
+    name = re.sub(r"\s+", " ", name)
+    return name.rstrip(" .")
+
+def atomic_write_json(path: str, data: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    # atomic replace
+    shutil.move(tmp, path)
+
+def load_progress() -> dict:
+    if not os.path.exists(PROGRESS_PATH):
+        return {"done_urls": [], "album_counts": {}}
+    try:
+        with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {"done_urls": [], "album_counts": {}}
+            data.setdefault("done_urls", [])
+            data.setdefault("album_counts", {})
+            return data
+    except Exception:
+        return {"done_urls": [], "album_counts": {}}
+
+def save_progress(progress: dict):
+    atomic_write_json(PROGRESS_PATH, progress)
+
+def fetch(url: str) -> str:
+    """
+    Fetch with small retry + block detection.
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            text = resp.text
+            # detect blocks (common AZLyrics interstitials)
+            if ("checking your browser" in text.lower()) or ("request for access" in text.lower()):
+                raise BlockedError("Detected anti-bot gate (interstitial).")
+            resp.raise_for_status()
+            return text
+        except BlockedError:
+            raise
+        except Exception as e:
+            if attempt >= MAX_RETRIES:
+                raise
+            # backoff with jitter
+            wait = RETRY_BASE_WAIT * (1.5 ** attempt) + random.uniform(0.0, 1.0)
+            print(f"Fetch error ({e}). Retry in ~{wait:.1f}s…")
+            time.sleep(wait)
+    raise RuntimeError("Unreachable")  # safety
+
+def extract_title_and_lyrics(html: str) -> Tuple[str, str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Title (primary: <b>"Song Title" lyrics</b>)
+    title = None
+    b = soup.find("b")
+    if b:
+        txt = b.get_text(" ", strip=True)
+        m = re.search(r'^"(.+?)"\s+lyrics', txt, re.IGNORECASE)
+        if m:
+            title = m.group(1)
+
+    # Fallback: <title>… - Title Lyrics | AZLyrics.com</title>
+    if not title and soup.title and soup.title.string:
+        m = re.search(r'-\s*(.+?)\s+Lyrics', soup.title.string, re.IGNORECASE)
+        if m:
+            title = m.group(1).strip()
+
+    if not title:
+        title = "Unknown Title"
+
+    # Lyrics via comment marker heuristic
+    lyrics_text = None
+    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        if "Usage of azlyrics.com content" in c:
+            node = c
+            for _ in range(6):  # scan a few siblings forward
+                node = node.next_sibling
+                if getattr(node, "name", None) == "div" and not node.attrs:
+                    lyrics_text = node.get_text("\n", strip=True)
+                    break
+            if lyrics_text:
+                break
+
+    # Fallback: largest plain <div> body
+    if not lyrics_text:
+        candidates = []
+        for div in soup.find_all("div"):
+            if div.attrs:
+                continue
+            t = div.get_text("\n", strip=True)
+            if t and len(t) > 200:
+                candidates.append((len(t), t))
+        if candidates:
+            candidates.sort(reverse=True)
+            lyrics_text = candidates[0][1]
+
+    if not lyrics_text:
+        raise ValueError("Could not locate lyrics (blocked or structure changed).")
+
+    return title, lyrics_text
+
+def save_lyrics(album: str, idx_in_album: int, title: str, lyrics: str) -> str:
+    album_dir = os.path.join(OUT_DIR, sanitize_filename(album or "Unknown Album"))
+    os.makedirs(album_dir, exist_ok=True)
+    fname = f"{idx_in_album:02d} - {sanitize_filename(title)}.txt"
+    path = os.path.join(album_dir, fname)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(title.strip() + "\n\n")
+        f.write(lyrics.strip() + "\n")
+    return path
+
+# -------------------------------
+# Artist page parsing for albums
+# -------------------------------
+def parse_artist_page_albums(html: str, base_url: str) -> List[Dict[str, str]]:
+    """
+    Returns a list of { 'url': <song_url>, 'album': <album_name or None> } in artist-page order.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    container = soup.find("div", id="listAlbum") or soup
+
+    songs = []
+    current_album = None
+
+    for node in container.descendants:
+        if getattr(node, "name", None) == "div" and "class" in node.attrs and "album" in node.get("class", []):
+            text = node.get_text(" ", strip=True)
+            m = re.search(r'"([^"]+)"', text)
+            if m:
+                current_album = m.group(1)
+            else:
+                current_album = text  # e.g., "other songs"
+        elif getattr(node, "name", None) == "a" and node.get("href"):
+            href = node["href"]
+            if any(prefix in href for prefix in ("/lyrics/", "../lyrics/", "../../lyrics/")):
+                full = urljoin(base_url, href)
+                if "/lyrics/taylorswift/" in full:
+                    songs.append({"url": full, "album": current_album})
+
+    # Deduplicate by URL preserving order
+    seen = set()
+    deduped = []
+    for s in songs:
+        u = s["url"]
+        if u not in seen:
+            seen.add(u)
+            deduped.append(s)
+    return deduped
+
+# -------------------------------
+# Resume bookkeeping
+# -------------------------------
+def scan_existing_album_counts() -> Dict[str, int]:
+    """
+    Scans OUT_DIR/<Album>/ files to infer max index per album (NN - Title.txt).
+    This makes numbering stable even if progress.json is missing.
+    """
+    counts: Dict[str, int] = {}
+    if not os.path.isdir(OUT_DIR):
+        return counts
+    for album in os.listdir(OUT_DIR):
+        album_dir = os.path.join(OUT_DIR, album)
+        if not os.path.isdir(album_dir):
+            continue
+        max_idx = 0
+        for name in os.listdir(album_dir):
+            m = re.match(r"^(\d{2})\s*-\s*", name)
+            if m:
+                try:
+                    idx = int(m.group(1))
+                    if idx > max_idx:
+                        max_idx = idx
+                except ValueError:
+                    pass
+        if max_idx > 0:
+            counts[album] = max_idx
+    return counts
+
+def should_skip_by_url(url: str, progress: dict) -> bool:
+    return url in progress.get("done_urls", [])
+
+def mark_done(url: str, album: str, progress: dict):
+    progress["done_urls"].append(url)
+    save_progress(progress)
+
+# -------------------------------
+# Main runner with resume
+# -------------------------------
+def run_azlyrics_album_grouped_with_resume():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    # Load + harden progress
+    progress = load_progress()
+
+    # Also scan filesystem to reconcile album_counts if needed
+    fs_counts = scan_existing_album_counts()
+    for album, c in fs_counts.items():
+        # prefer the larger of (progress, fs) to avoid reusing track numbers
+        progress["album_counts"][album] = max(c, progress["album_counts"].get(album, 0))
+
+    # Build entries
+    entries: List[Dict[str, str]] = []
+    if ARTIST_PAGE:
+        try:
+            print(f"Fetching artist page: {ARTIST_PAGE}")
+            html = fetch(ARTIST_PAGE)
+            print("Parsing albums and song links…")
+            entries = parse_artist_page_albums(html, ARTIST_PAGE)
+            print(f"Found {len(entries)} songs across albums.")
+        except BlockedError as be:
+            print(f"[Artist page] Blocked: {be}")
+            print("Please refresh/solve the interstitial, then rerun to resume.")
+            return
+        except Exception as e:
+            print("[Artist page] Error:", e)
+
+    if not entries and SONG_URLS:
+        entries = [{"url": u, "album": None} for u in SONG_URLS]
+
+    if not entries:
+        print("No songs to process. Set ARTIST_PAGE or add SONG_URLS.")
+        return
+
+    total = len(entries)
+    processed_new = 0
+
+    for i, item in enumerate(entries, 1):
+        url = item["url"]
+        album = item.get("album") or "Unknown Album"
+        album_safe = sanitize_filename(album)
+
+        if should_skip_by_url(url, progress):
+            # Already saved previously
+            print(f"[{i}/{total}] {album} -> (skipped, already done) {url}")
+            continue
+
+        # Determine next track index for this album
+        idx = progress["album_counts"].get(album_safe, 0) + 1
+
+        try:
+            print(f"[{i}/{total}] {album} #{idx} -> {url}")
+            html = fetch(url)
+            title, lyrics = extract_title_and_lyrics(html)
+            save_lyrics(album, idx, title, lyrics)
+
+            # Update counters + progress
+            progress["album_counts"][album_safe] = idx
+            mark_done(url, album_safe, progress)
+
+            processed_new += 1
+        except BlockedError as be:
+            print(f"Blocked on this song: {be}")
+            print("Exiting now so you can refresh. Rerun to resume automatically.")
+            break
+        except Exception as e:
+            print(f"Error on {url}: {e}")
+            # Do NOT bump album counter on failure; try next entry safely
+            # (You can choose to continue or stop; continuing is okay because
+            #  we assign idx only when saving successfully.)
+        finally:
+            sleep_random()
+
+    print(f"Done. Newly saved: {processed_new}. Total done so far: {len(progress['done_urls'])}.")
+
+# -------------------------------
+if __name__ == "__main__":
+    run_azlyrics_album_grouped_with_resume()
