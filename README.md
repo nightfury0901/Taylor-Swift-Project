@@ -6,7 +6,7 @@ It started as a **Taylor Swift lyrics project**, and it took me ~18 hours of tri
 
 ---
 
-## ✨ Features
+## Features
 - **Album Grouped Output**: Lyrics are saved into folders by album, with track numbers.  
 - **Randomized Delays & Headers**: Prevents hammering the site and reduces chance of blocking.  
 - **Resume Support**: Progress is tracked in `progress.json`, so you can stop and restart without re-downloading.  
