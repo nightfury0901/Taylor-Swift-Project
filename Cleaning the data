@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+Taylor Swift Lyrics Cleaner
+- Preserves line breaks and casing
+- Removes non-lyric markers ([Chorus], (x2), etc.)
+- Normalizes curly quotes/dashes/ellipsis
+- Trims AZLyrics-style footer/meta lines
+- Collapses extra blank lines (keeps stanza breaks)
+- Removes the first non-empty line (title)
+- Mirrors folder structure inputDir -> outputDir
+
+Usage (from your lyrics folder):
+  python clean_lyrics.py --inputDir . --outputDir .\data_clean --verbose
+"""
+
+import argparse
+import re
+from pathlib import Path
+
+def normalize_quotes(text: str) -> tuple[str, int]:
+    repl_map = {
+        "\u2018": "'",  # ‘
+        "\u2019": "'",  # ’
+        "\u201A": "'",  # ‚
+        "\u201C": '"',  # “
+        "\u201D": '"',  # ”
+        "\u201E": '"',  # „
+    }
+    count = 0
+    for k, v in repl_map.items():
+        occurrences = text.count(k)
+        if occurrences:
+            text = text.replace(k, v)
+            count += occurrences
+    return text, count
+
+def normalize_dashes_ellipsis(text: str) -> tuple[str, int]:
+    count = 0
+    for dash in ["\u2013", "\u2014", "\u2212"]:
+        c = text.count(dash)
+        if c:
+            text = text.replace(dash, "-")
+            count += c
+    c = text.count("\u2026")
+    if c:
+        text = text.replace("\u2026", "...")
+        count += c
+    return text, count
+
+BRACKET_TAG = re.compile(
+    r"""\[\s*(?:
+        intro|verse|pre[-\s]?chorus|chorus|post[-\s]?chorus|bridge|
+        refrain|hook|outro|solo|instrumental|drop|break|
+        verse\s*\d+|chorus\s*\d+
+    )\s*\]""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+PAREN_REPEAT = re.compile(
+    r"""\(\s*(?:
+        x\s*\d+|repeat|refrain|chorus|verse|bridge|instrumental|solo
+    )\s*\)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+FOOTER_LINE = re.compile(
+    r"""^\s*(?:
+        embed|you\s+might\s+also\s+like|writer\(s\)|writers?:|
+        lyrics\s+powered\s+by|azlyrics\.com|translation[s]?\s*:|
+        contributed\s+by|copyright|all\s+rights\s+reserved
+    ).*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+BOM = "\ufeff"
+
+def clean_text(raw: str, keep_section_tags: bool = False) -> dict:
+    stats = {
+        "linesBefore": 0, "linesAfter": 0,
+        "bracketTagsRemoved": 0, "parenTagsRemoved": 0,
+        "footerLinesRemoved": 0, "quotesNormalized": 0,
+        "dashEllipsisNormalized": 0, "blankLinesCollapsed": 0,
+        "titleLineRemoved": 0
+    }
+
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if text.startswith(BOM):
+        text = text.lstrip(BOM)
+
+    stats["linesBefore"] = len(text.splitlines())
+
+    text, qn = normalize_quotes(text)
+    stats["quotesNormalized"] += qn
+    text, dn = normalize_dashes_ellipsis(text)
+    stats["dashEllipsisNormalized"] += dn
+
+    if not keep_section_tags:
+        text, bt = BRACKET_TAG.subn("", text)
+        stats["bracketTagsRemoved"] += bt
+
+    text, pt = PAREN_REPEAT.subn("", text)
+    stats["parenTagsRemoved"] += pt
+
+    cleaned_lines = []
+    footer_removed = 0
+    for line in text.splitlines():
+        s = line.strip()
+        if FOOTER_LINE.match(s):
+            footer_removed += 1
+            continue
+        cleaned_lines.append(s)
+    stats["footerLinesRemoved"] = footer_removed
+
+    # Collapse multiple blank lines
+    collapsed_lines = []
+    blank_run = 0
+    for s in cleaned_lines:
+        if s == "":
+            blank_run += 1
+        else:
+            blank_run = 0
+        if blank_run <= 1:
+            collapsed_lines.append(s)
+        else:
+            stats["blankLinesCollapsed"] += 1
+
+    # 🔹 Drop the first NON-EMPTY line (title)
+    for idx, s in enumerate(collapsed_lines):
+        if s.strip() != "":
+            del collapsed_lines[idx]
+            stats["titleLineRemoved"] = 1
+            break
+
+    out = "\n".join(collapsed_lines).strip()
+    stats["linesAfter"] = len(out.splitlines()) if out else 0
+    return {"text": out, "stats": stats}
+
+def process_tree(input_dir: Path, output_dir: Path, dry_run: bool = False, verbose: bool = False, keep_section_tags: bool = False):
+    total = {
+        "files": 0, "linesBefore": 0, "linesAfter": 0,
+        "bracketTagsRemoved": 0, "parenTagsRemoved": 0,
+        "footerLinesRemoved": 0, "quotesNormalized": 0,
+        "dashEllipsisNormalized": 0, "blankLinesCollapsed": 0,
+        "titleLineRemoved": 0
+    }
+
+    txt_files = sorted(input_dir.rglob("*.txt"))
+    # Skip files inside the output directory (prevents re-cleaning)
+    txt_files = [p for p in txt_files if output_dir not in p.parents]
+
+    for src in txt_files:
+        rel = src.relative_to(input_dir)
+        dst = output_dir / rel
+
+        raw = src.read_text(encoding="utf-8", errors="ignore")
+        result = clean_text(raw, keep_section_tags=keep_section_tags)
+        out_text = result["text"]
+        stats = result["stats"]
+
+        if verbose:
+            print(f"- {rel}")
+            print(f"  lines: {stats['linesBefore']} -> {stats['linesAfter']} | "
+                  f"[tags] -{stats['bracketTagsRemoved']}, (paren) -{stats['parenTagsRemoved']} | "
+                  f"footer -{stats['footerLinesRemoved']} | normQuotes +{stats['quotesNormalized']} | "
+                  f"normDash/Ellip +{stats['dashEllipsisNormalized']} | blanks -{stats['blankLinesCollapsed']} | "
+                  f"titleRemoved {stats['titleLineRemoved']}")
+
+        for k in total.keys():
+            if k in ("files",):
+                continue
+            total[k] += stats.get(k, 0)
+        total["files"] += 1
+
+        if not dry_run:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(out_text, encoding="utf-8")
+
+    print("\n=== CLEAN SUMMARY ===")
+    print(f"Files processed: {total['files']}")
+    print(f"Lines: {total['linesBefore']} -> {total['linesAfter']} (Δ {total['linesAfter'] - total['linesBefore']})")
+    print(f"Removed [section] tags: {total['bracketTagsRemoved']}")
+    print(f"Removed (repeat/paren) tags: {total['parenTagsRemoved']}")
+    print(f"Removed footer/meta lines: {total['footerLinesRemoved']}")
+    print(f"Normalized quotes: {total['quotesNormalized']}")
+    print(f"Normalized dashes/ellipsis: {total['dashEllipsisNormalized']}")
+    print(f"Collapsed extra blank lines: {total['blankLinesCollapsed']}")
+    print(f"Title lines removed: {total['titleLineRemoved']}")
+
+def main():
+    ap = argparse.ArgumentParser(description="Clean Taylor Swift lyrics to analysis-ready TXT.")
+    ap.add_argument("--inputDir", type=Path, required=True, help="Root folder containing raw TXT files in subfolders.")
+    ap.add_argument("--outputDir", type=Path, required=True, help="Destination folder for cleaned TXT files (mirrors structure).")
+    ap.add_argument("--dryRun", action="store_true", help="Analyze & print stats without writing output files.")
+    ap.add_argument("--verbose", action="store_true", help="Print per-file stats.")
+    ap.add_argument("--keepSectionTags", action="store_true", help="Keep [Chorus]/[Verse] labels instead of removing.")
+    args = ap.parse_args()
+
+    process_tree(
+        input_dir=args.inputDir,
+        output_dir=args.outputDir,
+        dry_run=args.dryRun,
+        verbose=args.verbose,
+        keep_section_tags=args.keepSectionTags
+    )
+
+if __name__ == "__main__":
+    main()
