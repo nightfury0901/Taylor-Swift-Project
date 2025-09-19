@@ -1,0 +1,288 @@
+# geo_lyrics.py
+# Usage:
+#   python geo_lyrics.py --in lyrics.jsonl --outdir out/geo
+#
+# Outputs:
+#   - places_raw.csv              # each detected place per song
+#   - album_place_counts.csv      # pivot: album x place counts
+#   - places_geocoded.csv         # unique place canonical + lat/lon
+#   - ts_places_map.html          # Folium interactive map
+#   - ts_places_plotly.html       # Plotly globe (if years available)
+#   - cache/geocode_cache.json    # cached geocoder results
+#
+# Notes:
+# - Uses spaCy (en_core_web_sm) for NER labels: GPE, LOC, FAC
+# - Geocoding via Nominatim (OpenStreetMap) with polite rate limit + cache
+# - Includes alias normalization for common short forms (NYC, UK, USA, etc.)
+# - Basic disambiguation heuristics for very ambiguous names (e.g., "Paris")
+
+import argparse, json, time, re, os
+from pathlib import Path
+from collections import defaultdict, Counter
+
+import pandas as pd
+from unidecode import unidecode
+
+# ---- spaCy for NER ----
+import spacy
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    raise SystemExit("spaCy model not found. Run: python -m spacy download en_core_web_sm")
+
+# ---- Geocoding ----
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+
+ALLOWED_LABELS = {"GPE","LOC","FAC"}
+
+# Simple alias dictionary for normalization
+ALIASES = {
+    "nyc": "New York City",
+    "new york": "New York City",
+    "la": "Los Angeles",
+    "l.a.": "Los Angeles",
+    "uk": "United Kingdom",
+    "u.k.": "United Kingdom",
+    "usa": "United States",
+    "u.s.": "United States",
+    "u.s.a.": "United States",
+    "u.s.a": "United States",
+    "u.s": "United States",
+    "the states": "United States",
+    "the us": "United States",
+    "the u.s.": "United States",
+    "st. petersburg": "Saint Petersburg",
+}
+
+# Obvious ambiguity guardrails (very light-touch)
+# If a token is likely a person in Swift-verse, skip unless context says otherwise.
+AMBIGUOUS_PERSON_FIRSTNAMES = {"paris"}  # "Paris" (person) vs "Paris" (city)
+# You can add: {"august"} but it's also a month, we WANT time terms elsewhere, not here.
+
+# Optional: boost disambiguation by appending country context for famous cities
+DISAMBIG_HINTS = {
+    "Paris": ", France",
+    "London": ", United Kingdom",
+    "Los Angeles": ", USA",
+    "New York City": ", USA",
+    "Rome": ", Italy",
+    "Dublin": ", Ireland",
+    "Sydney": ", Australia",
+    "Melbourne": ", Australia",
+    "Toronto": ", Canada",
+    "Vancouver": ", Canada",
+    "Nashville": ", USA",
+}
+
+def normalize_place(p: str) -> str:
+    # Strip odd whitespace and accents; lowercase for alias lookup, then title-case if city-like
+    raw = p.strip()
+    if not raw:
+        return ""
+    # Keep original case for DISAMBIG_HINTS matching later; but alias map compares lowercase
+    low = unidecode(raw).lower()
+    if low in ALIASES:
+        return ALIASES[low]
+    # Basic cleanup of quotes/dots
+    cleaned = re.sub(r"\s+", " ", raw)
+    return cleaned
+
+def likely_person_name(token: str) -> bool:
+    return token.strip().lower() in AMBIGUOUS_PERSON_FIRSTNAMES
+
+def extract_places_spacy(text: str):
+    doc = nlp(text)
+    out = []
+    for ent in doc.ents:
+        if ent.label_ in ALLOWED_LABELS:
+            cand = normalize_place(ent.text)
+            if not cand:
+                continue
+            # skip obvious person-name ambiguity tokens if they stand alone (e.g., "Paris" with no context)
+            if likely_person_name(cand) and cand == ent.text.strip():
+                # keep it only if context includes a place-y hint nearby
+                # window around the entity
+                s = max(ent.start_char - 20, 0)
+                e = min(ent.end_char + 20, len(text))
+                ctx = text[s:e].lower()
+                if not any(k in ctx for k in ["city","town","country","in ","at ","from "]):
+                    continue
+            out.append(cand)
+    return out
+
+def load_jsonl(path: Path):
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="infile", required=True, help="Path to lyrics.jsonl")
+    ap.add_argument("--outdir", default="out/geo", help="Output directory")
+    ap.add_argument("--user_agent", default="ts-geo-ner/1.0 (academic, contact: you@example.com)",
+                    help="User-Agent for Nominatim (required by OSM usage policy)")
+    ap.add_argument("--sleep", type=float, default=1.0, help="Seconds between geocoding calls (politeness)")
+    args = ap.parse_args()
+
+    in_path = Path(args.infile)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    cache_dir = outdir / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "geocode_cache.json"
+    if cache_file.exists():
+        geocode_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+    else:
+        geocode_cache = {}
+
+    # 1) Load songs
+    songs = load_jsonl(in_path)
+
+    # 2) Extract places per song
+    recs = []  # rows for places_raw.csv
+    for r in songs:
+        album = r.get("album")
+        year = r.get("year")
+        title = r.get("songTitle")
+        lyrics = r.get("lyrics") or ""
+        places = extract_places_spacy(lyrics)
+
+        # tally per mention
+        for p in places:
+            recs.append({
+                "album": album,
+                "year": year,
+                "songTitle": title,
+                "place_raw": p
+            })
+
+    if not recs:
+        print("No places detected. Check spaCy install and labels.")
+        return
+
+    df_raw = pd.DataFrame(recs)
+    # canonicalization pass (alias normalization already done; unify casing)
+    # Title-case for readability where appropriate (avoid title-casing ALL CAPS country names)
+    def canonical(p):
+        p2 = p.strip()
+        # If looks like acronym (USA), keep upper
+        if re.fullmatch(r"[A-Z]{2,4}", p2):
+            return p2
+        # Otherwise title case common city forms; but keep words like "of", "and" lower-case
+        tc = " ".join([w.capitalize() if w.lower() not in {"of","and","the","de"} else w.lower()
+                       for w in re.split(r"\s+", p2)])
+        return tc
+
+    df_raw["place_canonical"] = df_raw["place_raw"].apply(canonical)
+
+    # 3) Pivot by album (counts)
+    pivot = (df_raw
+             .groupby(["album","place_canonical"])
+             .size()
+             .reset_index(name="count"))
+
+    wide = pivot.pivot(index="album", columns="place_canonical", values="count").fillna(0).astype(int)
+    wide.to_csv(outdir / "album_place_counts.csv", encoding="utf-8")
+
+    # 4) Geocode unique places
+    unique_places = sorted(df_raw["place_canonical"].unique())
+    geolocator = Nominatim(user_agent=args.user_agent, timeout=10)
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=args.sleep, swallow_exceptions=True)
+
+    geo_rows = []
+    for place in unique_places:
+        q = place
+        # Add a gentle hint for famously ambiguous names
+        if place in DISAMBIG_HINTS:
+            q = place + DISAMBIG_HINTS[place]
+
+        if place in geocode_cache:
+            item = geocode_cache[place]
+        else:
+            loc = geocode(q)
+            if loc is None and place != q:
+                # retry without hint
+                loc = geocode(place)
+            if loc is not None:
+                item = {"query": q, "address": loc.address, "lat": loc.latitude, "lon": loc.longitude, "src": "nominatim"}
+            else:
+                item = {"query": q, "address": None, "lat": None, "lon": None, "src": "nominatim"}
+            geocode_cache[place] = item
+            # persist incrementally
+            cache_file.write_text(json.dumps(geocode_cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        geo_rows.append({
+            "place": place,
+            "query_used": item["query"],
+            "address": item["address"],
+            "lat": item["lat"],
+            "lon": item["lon"],
+            "source": item["src"]
+        })
+
+    df_geo = pd.DataFrame(geo_rows)
+    df_geo.to_csv(outdir / "places_geocoded.csv", index=False, encoding="utf-8")
+
+    # 5) Save raw mentions
+    df_raw.to_csv(outdir / "places_raw.csv", index=False, encoding="utf-8")
+
+    # 6) Folium map (only for rows with coords)
+    try:
+        import folium
+        df_map = df_geo.dropna(subset=["lat","lon"]).copy()
+        if not df_map.empty:
+            mean_lat = df_map["lat"].mean()
+            mean_lon = df_map["lon"].mean()
+            m = folium.Map(location=[mean_lat, mean_lon], zoom_start=2)
+            # marker size ~ total mentions across albums
+            totals = pivot.groupby("place_canonical")["count"].sum()
+            totals = totals.to_dict()
+            for _, row in df_map.iterrows():
+                p = row["place"]
+                n = totals.get(p, 1)
+                folium.CircleMarker(
+                    location=[row["lat"], row["lon"]],
+                    radius=min(3 + n**0.5, 15),  # gentle scaling
+                    popup=f"{p} — mentions: {n}",
+                    fill=True
+                ).add_to(m)
+            m.save(str(outdir / "ts_places_map.html"))
+            print("✓ Wrote Folium map: ts_places_map.html")
+        else:
+            print("No geocoded points to map.")
+    except Exception as e:
+        print("Folium map skipped:", e)
+
+    # 7) Plotly globe (optional, needs year data)
+    try:
+        import plotly.express as px
+        df_plot = df_geo.merge(pivot.groupby("place_canonical")["count"].sum().reset_index(), left_on="place", right_on="place_canonical", how="left")
+        df_plot = df_plot.dropna(subset=["lat","lon"])
+        if not df_plot.empty:
+            fig = px.scatter_geo(
+                df_plot,
+                lat="lat", lon="lon",
+                hover_name="place",
+                size="count",
+                projection="natural earth"
+            )
+            fig.update_layout(title="Taylor Swift — Lyrical Geography (All Mentions)")
+            fig.write_html(str(outdir / "ts_places_plotly.html"))
+            print("✓ Wrote Plotly map: ts_places_plotly.html")
+    except Exception as e:
+        print("Plotly globe skipped:", e)
+
+    print("Done.")
+    print(f"Rows (raw mentions): {len(df_raw)}")
+    print(f"Unique places: {len(unique_places)}")
+    print(f"Output dir: {outdir}")
+
+if __name__ == "__main__":
+    main()
+
