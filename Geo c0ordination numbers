@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""
+Minimal geocoder: adds latitude/longitude to your CSV.
+
+Input CSV must have columns:
+- Region, State, Country, Continent
+
+Usage:
+  python geocode_langlon.py --in "F:\out\geo\For lang and lon.csv" --email you@example.com
+"""
+
+import argparse
+import time
+from pathlib import Path
+
+import pandas as pd
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderServiceError, GeocoderTimedOut
+
+
+def build_query(row: pd.Series) -> str:
+    parts = []
+    for col in ["Region", "State", "Country"]:
+        val = str(row.get(col, "")).strip()
+        if val and val.lower() != "nan":
+            parts.append(val)
+    if not parts:
+        cont = str(row.get("Continent", "")).strip()
+        if cont and cont.lower() != "nan":
+            parts.append(cont)
+    return ", ".join(parts)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="inp", required=True, help="Path to input CSV")
+    ap.add_argument("--out", dest="outp", default=None, help="Path to output CSV")
+    ap.add_argument("--email", dest="email", default=None, help="Email for Nominatim User-Agent (recommended)")
+    ap.add_argument("--min-seconds", type=float, default=1.2, help="Seconds to wait between lookups")
+    args = ap.parse_args()
+
+    inp_path = Path(args.inp)
+    if not inp_path.exists():
+        raise SystemExit(f"Input not found: {inp_path}")
+
+    df = pd.read_csv(inp_path)
+    for col in ["Region", "State", "Country", "Continent"]:
+        if col not in df.columns:
+            raise SystemExit(f"Missing required column: {col}")
+
+    ua = "geo-csv-min/1.0"
+    if args.email:
+        ua += f" ({args.email})"
+    geolocator = Nominatim(user_agent=ua)
+
+    lats, lons, names = [], [], []
+    total = len(df)
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        q = build_query(row)
+        lat = lon = name = None
+        if q:
+            tries = 0
+            while tries < 3:
+                try:
+                    loc = geolocator.geocode(q, addressdetails=True, exactly_one=True, timeout=15)
+                    if loc and loc.latitude is not None and loc.longitude is not None:
+                        lat, lon, name = float(loc.latitude), float(loc.longitude), loc.address
+                    break
+                except (GeocoderTimedOut, GeocoderServiceError):
+                    tries += 1
+                    time.sleep(args.min_seconds + 0.5)
+            time.sleep(args.min_seconds)
+        lats.append(lat)
+        lons.append(lon)
+        names.append(name)
+        if i % 10 == 0 or i == total:
+            print(f"[{i}/{total}] last query: {q!r} -> ({lat}, {lon})")
+
+    df["latitude"] = lats
+    df["longitude"] = lons
+    df["display_name"] = names
+
+    out_path = Path(args.outp) if args.outp else inp_path.with_name(inp_path.stem + "_with_latlon.csv")
+    df.to_csv(out_path, index=False)
+    print(f"Saved: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
